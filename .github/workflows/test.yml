@@ -1,0 +1,40 @@
+name: test
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-15-intel, macos-14]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Fixture tests with the native C++ toolchain
+        run: go test ./...
+
+  cross:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [linux, windows, darwin]
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: coalaura/build@v1
+        with:
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
+          cgo: true
+          optimization: compatible
+          generate: false
+          package: ./internal/probe
+          output: .build/probe-${{ matrix.os }}-${{ matrix.arch }}
