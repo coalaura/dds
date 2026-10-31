@@ -62,9 +62,9 @@ The default input/payload budget is 512 MiB, with dimensions limited to 32768 an
 
 ## Platforms
 
-Linux amd64/arm64 and Windows amd64/arm64 have linked successfully with Zig using portable CPU baselines; Linux links used static musl. Fixture tests have run on Windows amd64. The other targets were cross-built, not locally executed.
+CI cross-builds have passed for Linux, Windows and Darwin on both amd64 and arm64, using Zig with portable CPU baselines; Linux links use static musl. Native fixture tests have passed on Windows amd64 and macOS amd64.
 
-Darwin amd64/arm64 native sources compile, but final cross-linking on the Windows development host is blocked; Darwin is not yet verified. CI is configured for native Linux amd64/arm64, Windows amd64 and macOS amd64/arm64 tests, plus six-target cross-builds. The workflow has not yet been run as part of local validation.
+Native Linux amd64/arm64 tests await a CI rerun after fixing a bundled SAL macro conflict with GCC's standard library. The macOS arm64 job now uses `macos-15` after the `macos-14` runner retirement interrupted its run. Windows arm64 is cross-built only.
 
 ## Development
 
@@ -90,9 +90,9 @@ vet --cgo ./...
 
 Pins live in `internal/update/main.go`. The command copies selected sources/licenses, applies portability changes and generates `z_*.cpp` wrappers and DXGI constants. Existing checkouts can be supplied with `-source <directory>` containing `dds-DirectXTex`, `dds-DirectXMath` and `dds-DirectX-Headers`. Commit the generated outputs; consumers never run this command or `go generate`.
 
-When updating, review the isolated adaptations: lowercase `windows.h`, `DDS_NO_WIC` guards that retain platform allocators, portable `UNREFERENCED_PARAMETER`, shared SAL definitions, and `internal/native/dds_preflight.inc` for source-layout validation before allocation. Recheck patch anchors and upstream pitch/expansion rules, then run the native/cross-target workflow.
+When updating, review the isolated adaptations: lowercase `windows.h`, `DDS_NO_WIC` guards that retain platform allocators, portable `UNREFERENCED_PARAMETER`, shared SAL definitions with the unused `__valid` macro removed to avoid a libstdc++ collision, and `internal/native/dds_preflight.inc` for source-layout validation before allocation. Recheck patch anchors and upstream pitch/expansion rules, then run the native/cross-target workflow.
 
-The current Darwin cross-link blockers are the Windows-host Go linker's `rename a.out~ a.out: Access is denied` during Mach-O UUID rewriting, a missing macOS `resolv` library when bypassing that step, and Zig's unsupported `-no_uuid` argument with `-B none`. Verification needs a native macOS toolchain or a correctly provisioned cross-toolchain.
+For Darwin validation, use native macOS or the Linux-hosted CI cross-build environment. The Windows development host encountered Go Mach-O rewriting and macOS SDK linkage issues; both Darwin cross-builds pass in CI.
 
 Regenerate fixtures with:
 

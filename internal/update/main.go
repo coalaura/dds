@@ -139,7 +139,9 @@ func update(cache string) error {
 				text := strings.ReplaceAll(string(data), "\r\n", "\n")
 				before, _, _ := strings.Cut(text, "// SAL annotations")
 				end := strings.Index(text, "// Calling conventions")
-				data = []byte(before + "// Use the complete bundled SAL definitions shared with DirectXMath.\n#include <sal.h>\n\n" + text[end:])
+				annotations := "// Use the complete bundled SAL definitions shared with DirectXMath.\n#include <sal.h>\n\n"
+				annotations += "// The unused SAL1 macro collides with libstdc++'s integer parser.\n#undef __valid\n\n"
+				data = []byte(before + annotations + text[end:])
 			}
 
 			return write(filepath.Join(destination, relative), data)

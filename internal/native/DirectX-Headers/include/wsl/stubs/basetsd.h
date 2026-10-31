@@ -151,6 +151,9 @@ inline bool operator!=(REFGUID guidOne, REFGUID guidOther)
 // Use the complete bundled SAL definitions shared with DirectXMath.
 #include <sal.h>
 
+// The unused SAL1 macro collides with libstdc++'s integer parser.
+#undef __valid
+
 // Calling conventions
 #define __cdecl
 #define __stdcall
