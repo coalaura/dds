@@ -15,17 +15,31 @@ const (
 )
 
 const (
-	// DisplayStrict refuses float, signed, and integer data that has no faithful Go image model.
+	// DisplayStrict refuses float, signed, integer and extended-range XR data that has no faithful Go image model.
 	DisplayStrict DisplayMode = iota
 	// DisplayClamp explicitly converts such data to UNORM using DirectXTex's rules.
-	// Float values are clamped to [0,1]; SNORM is mapped from [-1,1] to [0,1].
+	// Float and XR values are clamped to [0,1]; SNORM is mapped from [-1,1] to [0,1].
 	// Integer formats use upstream integer-to-normalized conversion. No tone mapping
 	// or normal-map channel reconstruction is performed.
 	DisplayClamp
 )
 
+const (
+	// SourceColorDefault uses the destination's transfer function: sRGB for an
+	// sRGB format, linear otherwise. With nil Options, samples remain unchanged.
+	SourceColorDefault SourceColorSpace = iota
+	// SourceColorLinear treats RGB samples as linear light.
+	SourceColorLinear
+	// SourceColorSRGB treats RGB samples as already sRGB-encoded.
+	SourceColorSRGB
+)
+
 type ImagePrecision uint32
 type DisplayMode uint32
+
+// SourceColorSpace describes image RGB samples for Encode only. Alpha is never
+// gamma-corrected. FromImage and the native Texture API remain format-driven.
+type SourceColorSpace uint32
 
 // DecodeOptions selects one surface and its Go image conversion.
 // Interpretation is required for typeless data and otherwise must be UNKNOWN.
@@ -50,13 +64,20 @@ type DecodeOptions struct {
 // the input alpha convention; Straight/Premultiplied convert samples explicitly.
 // Compression applies only to BC output, Conversion only to uncompressed output.
 // Mipmaps, when non-nil, are generated before output conversion/compression.
+// SourceColorSpace defaults to the destination's transfer function. Mips are
+// filtered in linear light for sRGB input and retain the source encoding until
+// final conversion. Premultiplication changes operate on encoded samples.
+// SRGBIn/Out flags may redundantly agree with these interpretations, but cannot
+// override them: mip flags must match the source, and conversion/compression
+// flags must match source input and destination output. Contradictions error.
 type Options struct {
-	Format      Format
-	Header      HeaderMode
-	AlphaMode   AlphaMode
-	Compression *CompressionOptions
-	Conversion  *ConversionOptions
-	Mipmaps     *MipmapOptions
+	SourceColorSpace SourceColorSpace
+	Format           Format
+	Header           HeaderMode
+	AlphaMode        AlphaMode
+	Compression      *CompressionOptions
+	Conversion       *ConversionOptions
+	Mipmaps          *MipmapOptions
 }
 
 func init() {
@@ -86,7 +107,7 @@ func (texture *Texture) Image(options *DecodeOptions) (image.Image, error) {
 
 	info := texture.metadata.Format.Info()
 
-	err = imageSettings(info, settings)
+	err = imageSettings(texture.metadata.Format, settings)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +236,7 @@ func DecodeConfig(reader io.Reader) (image.Config, error) {
 
 	info := metadata.Format.Info()
 
-	err = imageSettings(info, DecodeOptions{})
+	err = imageSettings(metadata.Format, DecodeOptions{})
 	if err != nil {
 		return image.Config{}, err
 	}
@@ -257,6 +278,19 @@ func Encode(writer io.Writer, source image.Image, options *Options) error {
 		return err
 	}
 
+	format := settings.Format
+	if format == FormatUNKNOWN {
+		format = texture.metadata.Format
+	}
+
+	info := format.Info()
+	sourceSRGB := settings.SourceColorSpace == SourceColorSRGB || (settings.SourceColorSpace == SourceColorDefault && info.SRGB)
+
+	err = encodeColorSettings(settings, sourceSRGB, info.SRGB)
+	if err != nil {
+		return err
+	}
+
 	if settings.AlphaMode != AlphaUnknown {
 		texture, err = texture.WithAlphaMode(settings.AlphaMode, true)
 		if err != nil {
@@ -265,29 +299,61 @@ func Encode(writer io.Writer, source image.Image, options *Options) error {
 	}
 
 	if settings.Mipmaps != nil {
-		texture, err = texture.GenerateMipmaps(settings.Mipmaps)
+		mipmaps := *settings.Mipmaps
+
+		if sourceSRGB {
+			mipmaps.Filter |= FilterSRGBIn | FilterSRGBOut
+		}
+
+		texture, err = texture.GenerateMipmaps(&mipmaps)
 		if err != nil {
 			return err
 		}
 	}
 
-	format := settings.Format
-	if format == FormatUNKNOWN {
-		format = texture.metadata.Format
-	}
-
-	if format.Info().Compressed {
+	if info.Compressed {
 		if settings.Conversion != nil {
 			return fmt.Errorf("dds: Conversion options require uncompressed output")
 		}
 
-		texture, err = texture.Compress(format, settings.Compression)
+		compression := CompressionOptions{}
+
+		if settings.Compression != nil {
+			compression = *settings.Compression
+		}
+
+		if sourceSRGB {
+			compression.Flags |= CompressSRGBIn
+		}
+
+		texture, err = texture.Compress(format, &compression)
 	} else {
 		if settings.Compression != nil {
 			return fmt.Errorf("dds: Compression options require BC output")
 		}
 
-		texture, err = texture.Convert(format, settings.Conversion)
+		conversion := ConversionOptions{}
+
+		if settings.Conversion != nil {
+			conversion = *settings.Conversion
+		}
+
+		if sourceSRGB {
+			conversion.Filter |= FilterSRGBIn
+		}
+
+		// DirectXTex rejects same-format conversion. Float staging permits a
+		// transfer-only change without reducing 16-bit source precision.
+		if format == texture.metadata.Format && sourceSRGB {
+			texture, err = texture.Convert(FormatR32G32B32A32_FLOAT, &ConversionOptions{Filter: FilterSRGBIn})
+			if err != nil {
+				return err
+			}
+
+			conversion.Filter &^= FilterSRGBIn
+		}
+
+		texture, err = texture.Convert(format, &conversion)
 	}
 
 	if err != nil {
@@ -300,6 +366,7 @@ func Encode(writer io.Writer, source image.Image, options *Options) error {
 // FromImage copies an ordinary image, preserving RGBA premultiplication and 16-bit
 // precision. Generic images and palettes use 16-bit samples to avoid guessing their
 // precision. Grayscale is explicitly replicated into RGB; alpha-only images use white.
+// Samples are copied without transfer conversion into RGBA8 or RGBA16 UNORM.
 func FromImage(source image.Image) (*Texture, error) {
 	if source == nil {
 		return nil, fmt.Errorf("dds: nil image")
@@ -382,7 +449,9 @@ func FromImage(source image.Image) (*Texture, error) {
 	return texture, nil
 }
 
-func imageSettings(info FormatInfo, settings DecodeOptions) error {
+func imageSettings(format Format, settings DecodeOptions) error {
+	info := format.Info()
+
 	if settings.Precision > Precision16 || settings.Display > DisplayClamp || (settings.AlphaInterpretation != AlphaUnknown && settings.AlphaInterpretation != AlphaStraight && settings.AlphaInterpretation != AlphaPremultiplied) {
 		return fmt.Errorf("dds: invalid image conversion options")
 	}
@@ -391,11 +460,40 @@ func imageSettings(info FormatInfo, settings DecodeOptions) error {
 		return fmt.Errorf("dds: typeless pixels require an explicit compatible interpretation")
 	}
 
-	if settings.Display == DisplayStrict && info.DataType != TypeUNorm {
-		return fmt.Errorf("dds: signed, float and integer samples require explicit DisplayClamp or the Texture API")
+	if settings.Display == DisplayStrict && (info.DataType != TypeUNorm || format == FormatR10G10B10_XR_BIAS_A2_UNORM) {
+		return fmt.Errorf("dds: signed, float, integer and XR samples require explicit DisplayClamp or the Texture API")
 	}
 
 	return settings.Filter.validate()
+}
+
+func encodeColorSettings(settings Options, sourceSRGB, targetSRGB bool) error {
+	if settings.SourceColorSpace > SourceColorSRGB {
+		return fmt.Errorf("dds: invalid source color space %d", settings.SourceColorSpace)
+	}
+
+	if settings.Mipmaps != nil {
+		flags := settings.Mipmaps.Filter
+		if !sourceSRGB && flags&(FilterSRGBIn|FilterSRGBOut) != 0 {
+			return fmt.Errorf("dds: mipmap sRGB flags contradict linear source color space")
+		}
+	}
+
+	flags := FilterFlags(0)
+
+	if settings.Conversion != nil {
+		flags |= settings.Conversion.Filter
+	}
+
+	if settings.Compression != nil {
+		flags |= FilterFlags(settings.Compression.Flags)
+	}
+
+	if (!sourceSRGB && flags&FilterSRGBIn != 0) || (!targetSRGB && flags&FilterSRGBOut != 0) {
+		return fmt.Errorf("dds: sRGB flags contradict source color space or destination format")
+	}
+
+	return nil
 }
 
 func copyImageRows(texture *Texture, source image.Image) bool {

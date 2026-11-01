@@ -196,14 +196,11 @@ func (texture *Texture) Decompress(format Format) (*Texture, error) {
 	return nativeProcess(texture, 3, uint32(format), 0, 0, 0, nil)
 }
 
+// GenerateMipmaps replaces the mip chain. A one-level result retains only base
+// subresources, or returns texture itself if it already has one level.
 func (texture *Texture) GenerateMipmaps(options *MipmapOptions) (*Texture, error) {
-	if texture == nil {
-		return nil, fmt.Errorf("dds: nil texture")
-	}
-
-	err := texture.processingCheck(texture.metadata.Format, false)
-	if err != nil {
-		return nil, err
+	if texture == nil || len(texture.surfaces) == 0 {
+		return nil, fmt.Errorf("dds: invalid texture")
 	}
 
 	settings := MipmapOptions{}
@@ -212,7 +209,7 @@ func (texture *Texture) GenerateMipmaps(options *MipmapOptions) (*Texture, error
 		settings = *options
 	}
 
-	err = settings.Filter.validate()
+	err := settings.Filter.validate()
 	if err != nil {
 		return nil, err
 	}
@@ -223,6 +220,36 @@ func (texture *Texture) GenerateMipmaps(options *MipmapOptions) (*Texture, error
 	}
 
 	err = texture.outputCheck(texture.metadata.Format, levels)
+	if err != nil {
+		return nil, err
+	}
+
+	if levels == 1 {
+		if texture.metadata.MipLevels == 1 {
+			return texture, nil
+		}
+
+		metadata := texture.metadata
+		metadata.MipLevels = 1
+		surfaces := make([]Subresource, 0, metadata.ArraySize*metadata.Depth)
+
+		for item := range metadata.ArraySize {
+			for slice := range metadata.Depth {
+				index, indexErr := texture.surfaceIndex(Selection{Item: item, Slice: slice})
+				if indexErr != nil {
+					return nil, indexErr
+				}
+
+				surface := texture.surfaces[index]
+				surface.Pixels = texture.pixels[surface.offset : surface.offset+surface.SlicePitch]
+				surfaces = append(surfaces, surface)
+			}
+		}
+
+		return NewTexture(metadata, surfaces)
+	}
+
+	err = texture.processingCheck(texture.metadata.Format, false)
 	if err != nil {
 		return nil, err
 	}

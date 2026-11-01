@@ -993,6 +993,7 @@ namespace
             if (height <= 1)
             {
                 urow1 = urow0;
+                urow3 = urow2;
             }
 
             if (width <= 1)

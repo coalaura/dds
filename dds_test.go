@@ -18,6 +18,21 @@ type failingWriter struct{ err error }
 type failingReader struct{ err error }
 type shortWriter struct{}
 
+type colorCase struct {
+	name      string
+	options   Options
+	want      uint8
+	tolerance uint32
+}
+
+type encodingCase struct {
+	name      string
+	format    Format
+	channels  int
+	tolerance float64
+	mips      bool
+}
+
 func (writer failingWriter) Write([]byte) (int, error) {
 	return 0, writer.err
 }
@@ -340,6 +355,375 @@ func TestInvalidInputsAndOptions(t *testing.T) {
 	if err == nil {
 		t.Fatal("accepted overflowing pitch")
 	}
+}
+
+func TestEncodingColor(t *testing.T) {
+	source := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	source.SetNRGBA(0, 0, color.NRGBA{R: 128, G: 128, B: 128, A: 255})
+	cases := []colorCase{
+		{"default-unorm", Options{}, 128, 0},
+		{"default-srgb", Options{Format: FormatR8G8B8A8_UNORM_SRGB}, 128, 0},
+		{"explicit-srgb", Options{Format: FormatR8G8B8A8_UNORM_SRGB, SourceColorSpace: SourceColorSRGB, Conversion: &ConversionOptions{Filter: FilterSRGBIn | FilterSRGBOut}}, 128, 0},
+		{"linear-to-srgb", Options{Format: FormatR8G8B8A8_UNORM_SRGB, SourceColorSpace: SourceColorLinear}, 188, 257},
+		{"srgb-to-linear", Options{SourceColorSpace: SourceColorSRGB}, 55, 257},
+		{"bc7-srgb", Options{Format: FormatBC7_UNORM_SRGB}, 128, 3 * 257},
+		{"bc7-linear-to-srgb", Options{Format: FormatBC7_UNORM_SRGB, SourceColorSpace: SourceColorLinear}, 188, 3 * 257},
+		{"bc7-redundant-flags", Options{Format: FormatBC7_UNORM_SRGB, Compression: &CompressionOptions{Flags: CompressSRGBIn | CompressSRGBOut}}, 128, 3 * 257},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			texture := encodedImage(t, source, &test.options)
+			actual, err := texture.Image(nil)
+			check(t, err)
+			want := image.NewNRGBA(source.Bounds())
+			want.SetNRGBA(0, 0, color.NRGBA{R: test.want, G: test.want, B: test.want, A: 255})
+			compareImages(t, actual, want, test.tolerance)
+		})
+	}
+
+	t.Run("gamma-mips", func(t *testing.T) {
+		pattern := image.NewNRGBA(image.Rect(0, 0, 2, 1))
+		pattern.SetNRGBA(0, 0, color.NRGBA{A: 255})
+		pattern.SetNRGBA(1, 0, color.NRGBA{R: 255, G: 255, B: 255, A: 255})
+		texture := encodedImage(t, pattern, &Options{Format: FormatR8G8B8A8_UNORM_SRGB, Mipmaps: &MipmapOptions{Filter: FilterBox}})
+		mip, err := texture.Surface(Selection{Mip: 1})
+		check(t, err)
+
+		if mip.Pixels[0] != 188 || mip.Pixels[3] != 255 {
+			t.Fatalf("gamma mip: %v", mip.Pixels)
+		}
+	})
+
+	t.Run("wide-color-and-alpha", func(t *testing.T) {
+		wide := image.NewNRGBA64(image.Rect(0, 0, 2, 1))
+		wide.SetNRGBA64(0, 0, color.NRGBA64{R: 12345, G: 23456, B: 34567, A: 45678})
+		wide.SetNRGBA64(1, 0, color.NRGBA64{R: 54321, G: 43210, B: 32109, A: 45678})
+		texture := encodedImage(t, wide, &Options{SourceColorSpace: SourceColorSRGB, Mipmaps: &MipmapOptions{Filter: FilterBox}})
+		actual, err := texture.Image(&DecodeOptions{Surface: Selection{Mip: 1}})
+		check(t, err)
+		pixel := actual.(*image.NRGBA64).NRGBA64At(0, 0)
+		channels := [...]uint16{pixel.R, pixel.G, pixel.B}
+		first := [...]uint16{12345, 23456, 34567}
+		second := [...]uint16{54321, 43210, 32109}
+
+		for channel, value := range channels {
+			want := (linearSample(first[channel]) + linearSample(second[channel])) * 0.5 * 65535
+			if math.Abs(float64(value)-want) > 4 {
+				t.Fatalf("wide mip channel %d: %d, want %g", channel, value, want)
+			}
+		}
+
+		if texture.Metadata().Format != FormatR16G16B16A16_UNORM || pixel.A != 45678 {
+			t.Fatalf("lost precision or alpha: %+v, %+v", texture.Metadata(), pixel)
+		}
+
+		premultiplied := image.NewRGBA64(wide.Bounds())
+		premultiplied.SetRGBA64(0, 0, color.RGBA64{R: 12345, G: 23456, B: 34567, A: 45678})
+		texture = encodedImage(t, premultiplied, nil)
+		actual, err = texture.Image(nil)
+		check(t, err)
+		compareImages(t, actual, premultiplied, 0)
+
+		if _, ok := actual.(*image.RGBA64); !ok {
+			t.Fatalf("lost premultiplied convention: %T", actual)
+		}
+	})
+
+	t.Run("conflicts", func(t *testing.T) {
+		invalid := []Options{
+			{SourceColorSpace: SourceColorSpace(99)},
+			{SourceColorSpace: SourceColorLinear, Format: FormatR8G8B8A8_UNORM_SRGB, Conversion: &ConversionOptions{Filter: FilterSRGBIn}},
+			{SourceColorSpace: SourceColorLinear, Format: FormatBC7_UNORM_SRGB, Compression: &CompressionOptions{Flags: CompressSRGBIn}},
+			{SourceColorSpace: SourceColorSRGB, Conversion: &ConversionOptions{Filter: FilterSRGBOut}},
+			{Format: FormatBC7_UNORM, Compression: &CompressionOptions{Flags: CompressSRGBOut}},
+			{Mipmaps: &MipmapOptions{Filter: FilterSRGBIn}},
+			{Mipmaps: &MipmapOptions{Filter: FilterSRGBOut}},
+		}
+
+		for _, options := range invalid {
+			err := Encode(io.Discard, source, &options)
+			if err == nil {
+				t.Fatalf("accepted conflicting options: %+v", options)
+			}
+		}
+	})
+
+	native, err := FromImage(source)
+	check(t, err)
+	native, err = native.Convert(FormatR8G8B8A8_UNORM_SRGB, nil)
+	check(t, err)
+
+	if native.pixels[0] != 188 {
+		t.Fatal("native format-driven conversion changed")
+	}
+}
+
+func TestXRRange(t *testing.T) {
+	pixels := make([]byte, 4)
+	binary.LittleEndian.PutUint32(pixels, 1023<<10|384<<20|3<<30)
+	metadata := Metadata{Width: 1, Height: 1, Depth: 1, ArraySize: 1, MipLevels: 1, Format: FormatR10G10B10_XR_BIAS_A2_UNORM, Dimension: Dimension2D}
+	texture, err := NewTexture(metadata, []Subresource{{Width: 1, Height: 1, RowPitch: 4, SlicePitch: 4, Pixels: pixels}})
+	check(t, err)
+	texture = savedTexture(t, texture)
+
+	_, err = texture.Image(nil)
+	if err == nil {
+		t.Fatal("strict Image accepted XR")
+	}
+
+	var encoded bytes.Buffer
+
+	check(t, texture.Save(&encoded, nil))
+
+	_, err = Decode(bytes.NewReader(encoded.Bytes()))
+	if err == nil {
+		t.Fatal("strict Decode accepted XR")
+	}
+
+	_, err = DecodeConfig(bytes.NewReader(encoded.Bytes()))
+	if err == nil {
+		t.Fatal("DecodeConfig accepted XR")
+	}
+
+	clamped, err := DecodeWithOptions(&encoded, &DecodeOptions{Display: DisplayClamp})
+	check(t, err)
+
+	pixel := clamped.(*image.NRGBA64).NRGBA64At(0, 0)
+	if pixel != (color.NRGBA64{G: 65535, A: 65535}) {
+		t.Fatalf("XR clamp: %+v", pixel)
+	}
+
+	native, err := texture.Convert(FormatR32G32B32A32_FLOAT, nil)
+	check(t, err)
+
+	red := math.Float32frombits(binary.LittleEndian.Uint32(native.pixels))
+	green := math.Float32frombits(binary.LittleEndian.Uint32(native.pixels[4:]))
+
+	if math.Abs(float64(red)+384.0/510) > 0.00001 || math.Abs(float64(green)-639.0/510) > 0.00001 {
+		t.Fatalf("native XR range lost: %g, %g", red, green)
+	}
+}
+
+func TestOneLevelMipmaps(t *testing.T) {
+	base, err := FromImage(image.NewNRGBA(image.Rect(0, 0, 1, 1)))
+	check(t, err)
+	options := []*MipmapOptions{nil, {Levels: 1}}
+
+	for _, settings := range options {
+		result, mipErr := base.GenerateMipmaps(settings)
+		check(t, mipErr)
+
+		if result != base {
+			t.Fatal("one-level no-op did not return original texture")
+		}
+	}
+
+	legacy, err := os.ReadFile("testdata/legacy-rgb24.dds")
+	check(t, err)
+	binary.LittleEndian.PutUint32(legacy[8:], binary.LittleEndian.Uint32(legacy[8:])|0x20000)
+	binary.LittleEndian.PutUint32(legacy[28:], 2)
+	binary.LittleEndian.PutUint32(legacy[108:], binary.LittleEndian.Uint32(legacy[108:])|0x400008)
+	legacy = append(legacy, 12, 34, 56)
+	normalized, err := Load(bytes.NewReader(legacy), nil)
+	check(t, err)
+
+	if len(normalized.original) == 0 {
+		t.Fatal("test requires retained legacy representation")
+	}
+
+	textures := []*Texture{fixture(t, "array"), fixture(t, "cube-array"), fixture(t, "volume"), fixture(t, "one-dimensional"), fixture(t, "typeless"), fixture(t, "bc7"), normalized}
+
+	for _, texture := range textures {
+		result, mipErr := texture.GenerateMipmaps(&MipmapOptions{Levels: 1})
+		check(t, mipErr)
+
+		if texture.Metadata().MipLevels == 1 && result != texture {
+			t.Fatal("one-level no-op did not return original texture")
+		}
+
+		want := texture.Metadata()
+		want.MipLevels = 1
+
+		if result.Metadata() != want || result.SubresourceCount() != want.ArraySize*want.Depth || len(result.original) != 0 {
+			t.Fatalf("base-only metadata: %+v", result.Metadata())
+		}
+
+		result = savedTexture(t, result)
+		if result.Metadata() != want {
+			t.Fatal("save restored removed mips or changed metadata")
+		}
+
+		for item := range want.ArraySize {
+			for slice := range want.Depth {
+				selection := Selection{Item: item, Slice: slice}
+				before, surfaceErr := texture.Surface(selection)
+				check(t, surfaceErr)
+				after, surfaceErr := result.Surface(selection)
+				check(t, surfaceErr)
+
+				if before.Width != after.Width || before.Height != after.Height || !bytes.Equal(before.Pixels, after.Pixels) {
+					t.Fatalf("base surface changed: %+v", selection)
+				}
+			}
+		}
+	}
+}
+
+func TestBCEncoding(t *testing.T) {
+	cases := []encodingCase{
+		{"bc1", FormatBC1_UNORM, 4, 0.08, false},
+		{"bc2", FormatBC2_UNORM, 4, 0.08, false},
+		{"bc3", FormatBC3_UNORM, 4, 0.08, false},
+		{"bc4", FormatBC4_UNORM, 1, 0.04, false},
+		{"bc5", FormatBC5_UNORM, 2, 0.04, false},
+		// SNORM spans one unit per block: half a 1/7 palette step plus 8-bit quantization.
+		{"bc4-snorm", FormatBC4_SNORM, 1, 0.08, false},
+		{"bc5-snorm", FormatBC5_SNORM, 2, 0.08, false},
+		{"bc6-unsigned", FormatBC6H_UF16, 3, 0.15, false},
+		{"bc6-signed", FormatBC6H_SF16, 3, 0.15, false},
+		{"bc7", FormatBC7_UNORM, 4, 0.08, false},
+		{"bc7-srgb-mips", FormatBC7_UNORM_SRGB, 4, 0.08, true},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			pattern := image.NewNRGBA(image.Rect(0, 0, 5, 3))
+			values := make([]float32, 5*3*4)
+			kind := test.format.Info().DataType
+
+			for row := range 3 {
+				for column := range 5 {
+					step := uint8(16*column + 8*row)
+					pixel := color.NRGBA{R: 32 + step, G: 64 + step, B: 96 + step, A: 85 + uint8(17*(column+row))}
+
+					if test.format == FormatBC1_UNORM {
+						pixel.A = 255
+
+						if column == 0 && row == 0 {
+							pixel.A = 0
+						}
+					}
+
+					pattern.SetNRGBA(column, row, pixel)
+					offset := (row*5 + column) * 4
+					channels := [...]uint8{pixel.R, pixel.G, pixel.B, pixel.A}
+
+					for channel, value := range channels {
+						values[offset+channel] = float32(value) / 255
+					}
+
+					switch kind {
+					case TypeSNorm:
+						values[offset] = -0.75 + float32(column)*0.25 + float32(row)*0.125
+						values[offset+1] = -values[offset]
+					case TypeFloat:
+						variation := float32(column)*0.125 + float32(row)*0.0625
+						values[offset] = 2 + variation
+						values[offset+1] = 1 + variation
+						values[offset+2] = 3 + variation
+
+						if test.format == FormatBC6H_SF16 {
+							values[offset] *= -1
+							values[offset+2] *= -1
+						}
+					}
+				}
+			}
+
+			var compressed *Texture
+
+			if kind == TypeUNorm {
+				options := Options{Format: test.format}
+
+				if test.mips {
+					options.Mipmaps = &MipmapOptions{}
+				}
+
+				compressed = encodedImage(t, pattern, &options)
+			} else {
+				pixels := make([]byte, len(values)*4)
+
+				for index, value := range values {
+					binary.LittleEndian.PutUint32(pixels[index*4:], math.Float32bits(value))
+				}
+
+				metadata := Metadata{Width: 5, Height: 3, Depth: 1, ArraySize: 1, MipLevels: 1, Format: FormatR32G32B32A32_FLOAT, Dimension: Dimension2D}
+				native, err := NewTexture(metadata, []Subresource{{Width: 5, Height: 3, RowPitch: 80, SlicePitch: 240, Pixels: pixels}})
+				check(t, err)
+				compressed, err = native.Compress(test.format, nil)
+				check(t, err)
+			}
+
+			compressed = savedTexture(t, compressed)
+			levels := 1
+
+			if test.mips {
+				levels = 3
+			}
+
+			metadata := compressed.Metadata()
+			if metadata.Format != test.format || metadata.Width != 5 || metadata.Height != 3 || metadata.MipLevels != levels || compressed.SubresourceCount() != levels {
+				t.Fatalf("encoding metadata: %+v", metadata)
+			}
+
+			decoded, err := compressed.Decompress(FormatUNKNOWN)
+			check(t, err)
+			filter := FilterFlags(0)
+
+			if metadata.IsSRGB() {
+				filter = FilterSRGBOut
+			}
+
+			decoded, err = decoded.Convert(FormatR32G32B32A32_FLOAT, &ConversionOptions{Filter: filter})
+			check(t, err)
+
+			for index, want := range values {
+				channel := index % 4
+				if channel >= test.channels || (test.format == FormatBC1_UNORM && index < 3) {
+					continue
+				}
+
+				actual := math.Float32frombits(binary.LittleEndian.Uint32(decoded.pixels[index*4:]))
+				if math.IsNaN(float64(actual)) || math.Abs(float64(actual-want)) > test.tolerance {
+					t.Fatalf("pixel %d channel %d: %g, want %g (tolerance %g)", index/4, channel, actual, want, test.tolerance)
+				}
+			}
+		})
+	}
+}
+
+func encodedImage(t *testing.T, source image.Image, options *Options) *Texture {
+	t.Helper()
+
+	var encoded bytes.Buffer
+
+	check(t, Encode(&encoded, source, options))
+	texture, err := Load(&encoded, nil)
+	check(t, err)
+
+	return texture
+}
+
+func savedTexture(t *testing.T, texture *Texture) *Texture {
+	t.Helper()
+
+	var encoded bytes.Buffer
+
+	check(t, texture.Save(&encoded, nil))
+	result, err := Load(&encoded, nil)
+	check(t, err)
+
+	return result
+}
+
+func linearSample(value uint16) float64 {
+	sample := float64(value) / 65535
+	if sample <= 0.04045 {
+		return sample / 12.92
+	}
+
+	return math.Pow((sample+0.055)/1.055, 2.4)
 }
 
 func fixture(t *testing.T, name string) *Texture {

@@ -135,7 +135,8 @@ type CompressionOptions struct {
 }
 
 // MipmapOptions generates Levels total levels (including base); zero means a full
-// chain. Compressed/typeless inputs require explicit decompression/interpretation.
+// chain. Except for a one-level result (which only selects base subresources),
+// compressed/typeless inputs require explicit decompression/interpretation.
 // Filter zero selects box for power-of-two axes, otherwise linear for 2D or
 // triangle for 3D. Cubes are filtered per face, without cross-face seam filtering.
 type MipmapOptions struct {

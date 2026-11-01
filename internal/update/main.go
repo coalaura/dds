@@ -21,6 +21,36 @@ type dependency struct {
 	directory  string
 }
 
+type replacement struct {
+	anchor string
+	text   string
+	count  int
+}
+
+var patches = map[string][]replacement{
+	"DirectXTex/DirectXTexConvert.cpp": {{"#ifndef _WIN32", "#if !defined(_WIN32) || defined(DDS_NO_WIC)", 2}},
+	"DirectXTex/DirectXTexMipmaps.cpp": {
+		{"#ifdef _WIN32", "#if defined(_WIN32) && !defined(DDS_NO_WIC)", 5},
+		// Alias both row pointers when a box-filtered mip becomes one pixel high.
+		{
+			anchor: "            if (height <= 1)\n            {\n                urow1 = urow0;\n            }",
+			text:   "            if (height <= 1)\n            {\n                urow1 = urow0;\n                urow3 = urow2;\n            }",
+			count:  1,
+		},
+	},
+	"DirectXTex/DirectXTexResize.cpp": {{"#ifdef _WIN32", "#if defined(_WIN32) && !defined(DDS_NO_WIC)", 6}},
+	"DirectXTex/DirectXTexUtil.cpp": {
+		{"#ifdef _WIN32", "#if defined(_WIN32) && !defined(DDS_NO_WIC)", 2},
+		{"#else // !WIN32", "#elif !defined(_WIN32)", 1},
+	},
+	"DirectXTex/DirectXTexP.h": {{"<Windows.h>", "<windows.h>", 1}},
+	"DirectXTex/DirectXTexDDS.cpp": {{
+		anchor: "    size_t remaining = size - offset;\n    if (remaining == 0)\n        return E_FAIL;\n",
+		text:   "    size_t remaining = size - offset;\n    if (remaining == 0)\n        return E_FAIL;\n\n#include \"../../dds_preflight.inc\"\n",
+		count:  1,
+	}},
+}
+
 var dependencies = []dependency{
 	{"DirectXTex", "microsoft/DirectXTex", "ec66b78b37389e8373a8e14ccc3cd29be94146b3", "DirectXTex"},
 	{"DirectXMath", "microsoft/DirectXMath", "f5d82574b03417d905fdd2f85bfa9bf7a2f1deac", "Inc"},
@@ -131,17 +161,9 @@ func update(cache string) error {
 				return readErr
 			}
 
-			if dependency.name == "DirectXTex" {
-				data = patch(base, data)
-			}
-
-			if dependency.name == "DirectX-Headers" && base == "basetsd.h" {
-				text := strings.ReplaceAll(string(data), "\r\n", "\n")
-				before, _, _ := strings.Cut(text, "// SAL annotations")
-				end := strings.Index(text, "// Calling conventions")
-				annotations := "// Use the complete bundled SAL definitions shared with DirectXMath.\n#include <sal.h>\n\n"
-				annotations += "// The unused SAL1 macro collides with libstdc++'s integer parser.\n#undef __valid\n\n"
-				data = []byte(before + annotations + text[end:])
+			data, patchErr := patch(dependency.name+"/"+base, data)
+			if patchErr != nil {
+				return patchErr
 			}
 
 			return write(filepath.Join(destination, relative), data)
@@ -211,31 +233,70 @@ func update(cache string) error {
 	return write("format_generated.go", formatted)
 }
 
-func patch(name string, data []byte) []byte {
+func patch(name string, data []byte) ([]byte, error) {
+	if !strings.HasPrefix(name, "DirectXTex/") && name != "DirectX-Headers/basetsd.h" {
+		return data, nil
+	}
+
 	text := strings.ReplaceAll(string(data), "\r\n", "\n")
 	// Only these source files' WIN32 guards control WIC code. Keep platform
 	// allocation and file I/O guards in the other files intact.
-	if name == "DirectXTexConvert.cpp" || name == "DirectXTexMipmaps.cpp" || name == "DirectXTexResize.cpp" || name == "DirectXTexUtil.cpp" {
-		text = strings.ReplaceAll(text, "#ifdef _WIN32", "#if defined(_WIN32) && !defined(DDS_NO_WIC)")
-		text = strings.ReplaceAll(text, "#ifndef _WIN32", "#if !defined(_WIN32) || defined(DDS_NO_WIC)")
+	for _, change := range patches[name] {
+		err := checkAnchor(name, text, change.anchor, change.count)
+		if err != nil {
+			return nil, err
+		}
+
+		text = strings.ReplaceAll(text, change.anchor, change.text)
 	}
 
-	text = strings.ReplaceAll(text, "<Windows.h>", "<windows.h>")
-
-	if name == "DirectXTexUtil.cpp" {
-		text = strings.ReplaceAll(text, "#else // !WIN32", "#elif !defined(_WIN32)")
-	}
-
-	if name == "DirectXTexP.h" {
+	if name == "DirectXTex/DirectXTexP.h" {
 		text += "\n// MinGW's assignment-based macro rejects const references.\n#undef UNREFERENCED_PARAMETER\n#define UNREFERENCED_PARAMETER(value) (void)(value)\n"
 	}
 
-	if name == "DirectXTexDDS.cpp" {
-		needle := "    size_t remaining = size - offset;\n    if (remaining == 0)\n        return E_FAIL;\n"
-		text = strings.Replace(text, needle, needle+"\n#include \"../../dds_preflight.inc\"\n", 1)
+	if name == "DirectX-Headers/basetsd.h" {
+		annotations := "// Use the complete bundled SAL definitions shared with DirectXMath.\n#include <sal.h>\n\n"
+		annotations += "// The unused SAL1 macro collides with libstdc++'s integer parser.\n#undef __valid\n\n"
+
+		var err error
+
+		text, err = replaceSection(name, text, "// SAL annotations", "// Calling conventions", annotations)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	return []byte(text)
+	return []byte(text), nil
+}
+
+func checkAnchor(name, text, anchor string, expected int) error {
+	count := strings.Count(text, anchor)
+	if count != expected {
+		return fmt.Errorf("patch %s: anchor %q: expected %d matches, got %d; check the pinned upstream source and patch", name, anchor, expected, count)
+	}
+
+	return nil
+}
+
+func replaceSection(name, text, start, end, replacement string) (string, error) {
+	err := checkAnchor(name, text, start, 1)
+	if err != nil {
+		return "", err
+	}
+
+	err = checkAnchor(name, text, end, 1)
+	if err != nil {
+		return "", err
+	}
+
+	first := strings.Index(text, start)
+	last := strings.Index(text, end)
+
+	if last <= first {
+		return "", fmt.Errorf("patch %s: anchor %q must precede %q; check the pinned upstream source and patch", name, start, end)
+	}
+
+	return text[:first] + replacement + text[last:], nil
 }
 
 func write(path string, data []byte) error {
