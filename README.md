@@ -62,9 +62,7 @@ The default input/payload budget is 512 MiB, with dimensions limited to 32768 an
 
 ## Platforms
 
-CI cross-builds have passed for Linux, Windows and Darwin on both amd64 and arm64, using Zig with portable CPU baselines; Linux links use static musl. Native fixture tests have passed on Windows amd64 and macOS amd64.
-
-Native Linux amd64/arm64 tests await a CI rerun after fixing a bundled SAL macro conflict with GCC's standard library. The macOS arm64 job now uses `macos-15` after the `macos-14` runner retirement interrupted its run. Windows arm64 is cross-built only.
+Linux, Windows and macOS on amd64 and arm64, with portable CPU baselines.
 
 ## Development
 
@@ -91,8 +89,6 @@ vet --cgo ./...
 Pins live in `internal/update/main.go`. The command copies selected sources/licenses, applies portability changes and generates `z_*.cpp` wrappers and DXGI constants. Existing checkouts can be supplied with `-source <directory>` containing `dds-DirectXTex`, `dds-DirectXMath` and `dds-DirectX-Headers`. Commit the generated outputs; consumers never run this command or `go generate`.
 
 When updating, review the isolated adaptations: lowercase `windows.h`, `DDS_NO_WIC` guards that retain platform allocators, portable `UNREFERENCED_PARAMETER`, shared SAL definitions with the unused `__valid` macro removed to avoid a libstdc++ collision, and `internal/native/dds_preflight.inc` for source-layout validation before allocation. Recheck patch anchors and upstream pitch/expansion rules, then run the native/cross-target workflow.
-
-For Darwin validation, use native macOS or the Linux-hosted CI cross-build environment. The Windows development host encountered Go Mach-O rewriting and macOS SDK linkage issues; both Darwin cross-builds pass in CI.
 
 Regenerate fixtures with:
 
