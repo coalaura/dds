@@ -91,7 +91,14 @@ func nativeProcess(texture *Texture, operation, target, flags uint32, threshold 
 		}
 		return nil, writeErr
 	}
-	return copyResult(result), nil
+	converted := copyResult(result)
+	if operation == 4 {
+		// DirectXTex's volume mip initializer drops semantic metadata.
+		converted.metadata.MiscFlags = texture.metadata.MiscFlags
+		converted.metadata.MiscFlags2 = texture.metadata.MiscFlags2
+	}
+
+	return converted, nil
 }
 
 func copyResult(result *C.dds_result) *Texture {

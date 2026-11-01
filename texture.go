@@ -102,6 +102,10 @@ func (texture *Texture) OriginalDDS() []byte {
 // Convert converts uncompressed native samples. Float/HDR and signed values are
 // retained when the destination permits them. Conversion to UNORM explicitly
 // clamps/maps values according to DirectXTex; it does not perform tone mapping.
+// Transfer functions apply to stored RGB, independently of alpha metadata. Thus
+// premultiplied sRGB uses sRGB(alpha * linear RGB). For encoded-associated input,
+// first call WithAlphaMode(AlphaStraight, true). Same-format conversion is a no-op
+// only with zero options; it cannot request a transfer-only change.
 func (texture *Texture) Convert(format Format, options *ConversionOptions) (*Texture, error) {
 	err := texture.processingCheck(format, false)
 	if err != nil {
@@ -135,6 +139,8 @@ func (texture *Texture) Convert(format Format, options *ConversionOptions) (*Tex
 	return nativeProcess(texture, 1, uint32(format), uint32(settings.Filter), threshold, 0, nil)
 }
 
+// Compress encodes native samples using the same format-driven transfer and alpha
+// convention as Convert. It does not associate/unassociate or discard hidden RGB.
 func (texture *Texture) Compress(format Format, options *CompressionOptions) (*Texture, error) {
 	err := texture.processingCheck(format, true)
 	if err != nil {
@@ -174,6 +180,8 @@ func (texture *Texture) Compress(format Format, options *CompressionOptions) (*T
 
 // Decompress expands BC data. FormatUNKNOWN selects a precision-preserving default:
 // RGBA8 for BC1-3/7, R/RG UNORM or SNORM for BC4/5, and RGBA16 float for BC6H.
+// The default retains sRGB encoding; an explicit output format follows Convert's
+// per-channel transfer semantics, without changing alpha association metadata.
 func (texture *Texture) Decompress(format Format) (*Texture, error) {
 	if texture == nil || len(texture.surfaces) == 0 || !texture.metadata.Format.Info().Compressed || texture.metadata.Format.Info().Typeless {
 		return nil, fmt.Errorf("dds: decompress requires a typed BC texture")
@@ -198,6 +206,11 @@ func (texture *Texture) Decompress(format Format) (*Texture, error) {
 
 // GenerateMipmaps replaces the mip chain. A one-level result retains only base
 // subresources, or returns texture itself if it already has one level.
+// Declared straight-alpha color is filtered in linear premultiplied space unless
+// FilterSeparateAlpha explicitly requests independent channel filtering. Unknown,
+// custom and opaque alpha use independent channels. Premultiplied input must use
+// linear association (sRGB(alpha * linear RGB) for sRGB storage). Native signed/HDR
+// channels are not clamped. Base samples and alpha metadata are preserved.
 func (texture *Texture) GenerateMipmaps(options *MipmapOptions) (*Texture, error) {
 	if texture == nil || len(texture.surfaces) == 0 {
 		return nil, fmt.Errorf("dds: invalid texture")
@@ -254,12 +267,71 @@ func (texture *Texture) GenerateMipmaps(options *MipmapOptions) (*Texture, error
 		return nil, err
 	}
 
+	if texture.metadata.AlphaMode() == AlphaStraight && texture.metadata.Format.Info().Alpha && settings.Filter&FilterSeparateAlpha == 0 {
+		return texture.alphaMipmaps(settings, levels)
+	}
+
 	return nativeProcess(texture, 4, 0, uint32(settings.Filter), 0, levels, nil)
+}
+
+func (texture *Texture) alphaMipmaps(settings MipmapOptions, levels int) (*Texture, error) {
+	err := texture.outputCheck(FormatR32G32B32A32_FLOAT, levels)
+	if err != nil {
+		return nil, err
+	}
+
+	working, err := floatCopy(texture, settings.Filter&FilterSRGBIn)
+	if err != nil {
+		return nil, err
+	}
+
+	transformColor(working, false, false, AlphaStraight, AlphaPremultiplied)
+	filter := settings.Filter &^ (FilterSRGBIn | FilterSRGBOut)
+
+	working, err = nativeProcess(working, 4, 0, uint32(filter), 0, levels, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	transformColor(working, false, false, AlphaPremultiplied, AlphaStraight)
+
+	outputFilter := settings.Filter & FilterSRGBOut
+	if texture.metadata.Format == FormatR32G32B32A32_FLOAT && outputFilter != 0 {
+		transformColor(working, false, true, AlphaStraight, AlphaStraight)
+		outputFilter = 0
+	}
+
+	result, err := working.Convert(texture.metadata.Format, &ConversionOptions{Filter: outputFilter})
+	if err != nil {
+		return nil, err
+	}
+
+	// Conversion round trips must not alter the retained base levels, including
+	// hidden RGB at zero alpha. Only newly generated levels require processing.
+	for item := range texture.metadata.ArraySize {
+		for slice := range texture.metadata.Depth {
+			selection := Selection{Item: item, Slice: slice}
+			sourceIndex, _ := texture.surfaceIndex(selection)
+			targetIndex, _ := result.surfaceIndex(selection)
+			source := texture.surfaces[sourceIndex]
+			target := result.surfaces[targetIndex]
+
+			for row := range source.Height {
+				copy(result.pixels[target.offset+row*target.RowPitch:target.offset+(row+1)*target.RowPitch], texture.pixels[source.offset+row*source.RowPitch:source.offset+(row+1)*source.RowPitch])
+			}
+		}
+	}
+
+	return result, nil
 }
 
 // WithAlphaMode premultiplies or unpremultiplies samples using DirectXTex.
 // Only straight <-> premultiplied transitions are supported. ignoreSRGB controls
 // whether multiplication takes place on encoded samples rather than linear light.
+// For sRGB, false produces/expects sRGB(alpha * linear RGB), whereas true
+// produces/expects alpha * sRGB(RGB). DDS cannot record this distinction: Image
+// defaults to the former; DecodeOptions.Premultiplication selects the latter.
+// No distinction exists for linear formats. All subresources are processed.
 func (texture *Texture) WithAlphaMode(mode AlphaMode, ignoreSRGB bool) (*Texture, error) {
 	if texture == nil {
 		return nil, fmt.Errorf("dds: nil texture")

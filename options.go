@@ -34,7 +34,9 @@ const (
 	// HeaderLegacy requires a DX9 header and errors if the texture cannot be represented.
 	// Non-legacy metadata such as straight/opaque alpha intent cannot be preserved.
 	HeaderLegacy
-	// HeaderAuto lets DirectXTex choose a legacy header when representable.
+	// HeaderAuto lets DirectXTex choose a legacy header when representable, with
+	// the same alpha-metadata limitations as HeaderLegacy. Prefer HeaderDefault
+	// or HeaderDX10 when alpha association must survive serialization.
 	HeaderAuto
 	// HeaderDX10 always writes normalized DXGI pixels and all supported metadata.
 	HeaderDX10

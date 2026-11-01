@@ -25,6 +25,16 @@ type colorCase struct {
 	tolerance uint32
 }
 
+type alphaColorCase struct {
+	name      string
+	wide      bool
+	space     SourceColorSpace
+	format    Format
+	pixels    []color.NRGBA64
+	mips      bool
+	tolerance uint32
+}
+
 type encodingCase struct {
 	name      string
 	format    Format
@@ -123,10 +133,26 @@ func TestIndependentReferences(t *testing.T) {
 		}
 
 		decoded, err := texture.Image(nil)
+
+		if name == "legacy-DXT4" {
+			// The fixture's RGB565 endpoint expands to red 132, above alpha 128.
+			// Native decoding retains it; a normalized Go image needs explicit clamping.
+			if err == nil {
+				t.Fatal("accepted out-of-range DXT4 premultiplication")
+			}
+
+			decoded, err = texture.Image(&DecodeOptions{Display: DisplayClamp})
+		}
+
 		check(t, err)
 
 		if _, ok := decoded.(*image.RGBA); !ok {
 			t.Fatalf("premultiplied image type: %T", decoded)
+		}
+
+		red, green, blue, alpha := decoded.At(0, 0).RGBA()
+		if red > alpha || green > alpha || blue > alpha {
+			t.Fatal("invalid Go premultiplied color")
 		}
 	}
 
@@ -358,6 +384,9 @@ func TestInvalidInputsAndOptions(t *testing.T) {
 }
 
 func TestEncodingColor(t *testing.T) {
+	t.Run("association", testColorAssociation)
+	t.Run("native-association", testNativeAssociation)
+	t.Run("complete-texture", testCompleteColor)
 	source := image.NewNRGBA(image.Rect(0, 0, 1, 1))
 	source.SetNRGBA(0, 0, color.NRGBA{R: 128, G: 128, B: 128, A: 255})
 	cases := []colorCase{
@@ -456,6 +485,288 @@ func TestEncodingColor(t *testing.T) {
 
 	if native.pixels[0] != 188 {
 		t.Fatal("native format-driven conversion changed")
+	}
+}
+
+func testColorAssociation(t *testing.T) {
+	partial := []color.NRGBA64{{R: 32896, G: 32896, B: 32896, A: 32896}, {}, {R: 65535, G: 65535, B: 65535, A: 65535}}
+	cases := []alphaColorCase{
+		{"srgb-to-linear", false, SourceColorSRGB, FormatR8G8B8A8_UNORM, partial, false, 2 * 257},
+		{"linear-to-srgb", false, SourceColorLinear, FormatR8G8B8A8_UNORM_SRGB, partial, false, 2 * 257},
+		{"wide-small-alpha", true, SourceColorSRGB, FormatR16G16B16A16_UNORM, []color.NRGBA64{{R: 12345, G: 23456, B: 34567, A: 45678}, {R: 65535, G: 65535, B: 65535, A: 1}, {}}, false, 4},
+		{"bc7-srgb", false, SourceColorSRGB, FormatBC7_UNORM_SRGB, partial[:1], false, 4 * 257},
+		{"transparent-mip", false, SourceColorSRGB, FormatR8G8B8A8_UNORM_SRGB, []color.NRGBA64{{R: 65535, G: 65535, B: 65535, A: 65535}, {R: 65535}}, true, 257},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			bounds := image.Rect(0, 0, len(test.pixels), 1)
+
+			var (
+				straight   image.Image
+				associated image.Image
+			)
+
+			if test.wide {
+				input := image.NewNRGBA64(bounds)
+				premultiplied := image.NewRGBA64(bounds)
+
+				for column, pixel := range test.pixels {
+					input.SetNRGBA64(column, 0, pixel)
+					premultiplied.Set(column, 0, pixel)
+				}
+
+				straight = input
+				associated = premultiplied
+			} else {
+				input := image.NewNRGBA(bounds)
+				premultiplied := image.NewRGBA(bounds)
+
+				for column, pixel := range test.pixels {
+					input.Set(column, 0, pixel)
+					premultiplied.Set(column, 0, pixel)
+				}
+
+				straight = input
+				associated = premultiplied
+			}
+
+			options := Options{Format: test.format, SourceColorSpace: test.space}
+			selection := Selection{}
+
+			if test.mips {
+				options.Mipmaps = &MipmapOptions{Filter: FilterBox}
+				selection.Mip = 1
+			}
+
+			inputs := []image.Image{straight, associated}
+
+			for _, input := range inputs {
+				texture := encodedImage(t, input, &options)
+				actual, err := texture.Image(&DecodeOptions{Surface: selection})
+				check(t, err)
+
+				if texture.Metadata().Format != test.format || texture.Metadata().Width != bounds.Dx() {
+					t.Fatal("lost format or dimensions")
+				}
+
+				for column := range actual.Bounds().Dx() {
+					pixel := test.pixels[column]
+
+					if test.mips {
+						// Opaque white plus transparent red has white straight RGB,
+						// with half coverage, independent of the hidden red sample.
+						pixel = color.NRGBA64{R: 65535, G: 65535, B: 65535, A: 32768}
+					}
+
+					red, green, blue, alpha := actual.At(column, 0).RGBA()
+					if red > alpha || green > alpha || blue > alpha {
+						t.Fatalf("invalid Go premultiplication: %d %d %d / %d", red, green, blue, alpha)
+					}
+
+					channels := [...]uint32{red, green, blue, alpha}
+					reference := [...]uint16{pixel.R, pixel.G, pixel.B, pixel.A}
+
+					for channel, value := range channels {
+						want := float64(reference[channel])
+
+						if channel < 3 {
+							want /= 65535
+
+							if test.space == SourceColorSRGB {
+								want = linearSample(reference[channel])
+							}
+
+							if test.format.Info().SRGB {
+								if want <= 0.0031308 {
+									want *= 12.92
+								} else {
+									want = 1.055*math.Pow(want, 1/2.4) - 0.055
+								}
+							}
+
+							want *= float64(pixel.A)
+						}
+
+						if math.Abs(float64(value)-want) > float64(test.tolerance) {
+							t.Fatalf("%T pixel %d channel %d: %d, want %g", input, column, channel, value, want)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func testNativeAssociation(t *testing.T) {
+	pattern := image.NewNRGBA(image.Rect(0, 0, 2, 1))
+	pattern.SetNRGBA(0, 0, color.NRGBA{R: 255, G: 255, B: 255, A: 255})
+	pattern.SetNRGBA(1, 0, color.NRGBA{R: 255})
+	texture := encodedImage(t, pattern, &Options{Format: FormatR8G8B8A8_UNORM_SRGB})
+	mips, err := texture.GenerateMipmaps(&MipmapOptions{Filter: FilterBox})
+	check(t, err)
+	mips = savedTexture(t, mips)
+	actual, err := mips.Image(&DecodeOptions{Surface: Selection{Mip: 1}})
+	check(t, err)
+
+	if actual.(*image.NRGBA).NRGBAAt(0, 0) != (color.NRGBA{R: 255, G: 255, B: 255, A: 128}) {
+		t.Fatalf("straight alpha mip: %v", actual.At(0, 0))
+	}
+
+	conventions := []bool{false, true}
+
+	for _, encoded := range conventions {
+		premultiplied, alphaErr := mips.WithAlphaMode(AlphaPremultiplied, encoded)
+		check(t, alphaErr)
+		premultiplied = savedTexture(t, premultiplied)
+		settings := DecodeOptions{Surface: Selection{Mip: 1}}
+
+		if encoded {
+			settings.Premultiplication = SRGBPremultipliedEncoded
+		}
+
+		actual, err = premultiplied.Image(&settings)
+		check(t, err)
+
+		if actual.(*image.RGBA).RGBAAt(0, 0) != (color.RGBA{R: 128, G: 128, B: 128, A: 128}) {
+			t.Fatalf("encoded=%v: %v", encoded, actual.At(0, 0))
+		}
+
+		settings.Precision = Precision16
+		actual, err = premultiplied.Image(&settings)
+		check(t, err)
+
+		if actual.(*image.RGBA64).RGBA64At(0, 0) != (color.RGBA64{R: 32896, G: 32896, B: 32896, A: 32896}) {
+			t.Fatalf("wide quantized white: %v", actual.At(0, 0))
+		}
+
+		straight, alphaErr := premultiplied.WithAlphaMode(AlphaStraight, encoded)
+		check(t, alphaErr)
+		actual, err = savedTexture(t, straight).Image(&DecodeOptions{Surface: Selection{Mip: 1}})
+		check(t, err)
+
+		if actual.(*image.NRGBA).NRGBAAt(0, 0).R != 255 {
+			t.Fatal("alpha reversal changed white")
+		}
+	}
+
+	premultiplied := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	premultiplied.SetRGBA(0, 0, color.RGBA{R: 64, G: 64, B: 64, A: 128})
+
+	withoutAlpha := encodedImage(t, premultiplied, &Options{Format: FormatR8_UNORM})
+	if withoutAlpha.pixels[0] != 128 || withoutAlpha.Metadata().AlphaMode() != AlphaOpaque {
+		t.Fatalf("alpha discarded without unassociation: %v", withoutAlpha.pixels)
+	}
+
+	premultiplied.SetRGBA(0, 0, color.RGBA{R: 200, A: 128})
+	invalid, err := FromImage(premultiplied)
+	check(t, err)
+
+	_, err = invalid.Image(nil)
+	if err == nil {
+		t.Fatal("returned invalid Go premultiplication")
+	}
+
+	clamped, err := invalid.Image(&DecodeOptions{Display: DisplayClamp})
+	check(t, err)
+
+	if clamped.(*image.RGBA).RGBAAt(0, 0) != (color.RGBA{R: 128, A: 128}) {
+		t.Fatal("explicit premultiplication clamp failed")
+	}
+
+	premultiplied.SetRGBA(0, 0, color.RGBA{R: 200})
+	invalid, err = FromImage(premultiplied)
+	check(t, err)
+	invalid, err = invalid.Convert(FormatR8G8B8A8_UNORM_SRGB, nil)
+	check(t, err)
+	invalid = savedTexture(t, invalid)
+
+	_, err = invalid.Image(nil)
+	if err == nil {
+		t.Fatal("zero alpha concealed invalid sRGB premultiplication")
+	}
+
+	clamped, err = invalid.Image(&DecodeOptions{Display: DisplayClamp})
+	check(t, err)
+
+	if clamped.(*image.RGBA).RGBAAt(0, 0) != (color.RGBA{}) {
+		t.Fatal("explicit zero-alpha clamp failed")
+	}
+}
+
+func testCompleteColor(t *testing.T) {
+	texture := fixture(t, "cube-array")
+	fixtureTexture := texture
+	original := bytes.Clone(texture.pixels)
+	surfaces := make([]Subresource, len(texture.surfaces))
+
+	for index, surface := range texture.surfaces {
+		surface.Pixels = bytes.Clone(texture.pixels[surface.offset : surface.offset+surface.SlicePitch])
+
+		for offset := 3; offset < len(surface.Pixels); offset += 4 {
+			surface.Pixels[offset] = 128
+		}
+
+		surfaces[index] = surface
+	}
+
+	texture, err := NewTexture(texture.Metadata(), surfaces)
+	check(t, err)
+	linear, err := texture.Convert(FormatR32G32B32A32_FLOAT, nil)
+	check(t, err)
+	linear, err = linear.WithAlphaMode(AlphaPremultiplied, false)
+	check(t, err)
+	encoded, err := linear.Convert(FormatR8G8B8A8_UNORM_SRGB, nil)
+	check(t, err)
+
+	encoded = savedTexture(t, encoded)
+	if encoded.Metadata().ArraySize != 12 || encoded.Metadata().MipLevels != 3 || !encoded.Metadata().IsCube() || encoded.Metadata().AlphaMode() != AlphaPremultiplied {
+		t.Fatalf("lost complete texture metadata: %+v", encoded.Metadata())
+	}
+
+	for item := range 12 {
+		for mip := range 3 {
+			actual, imageErr := encoded.Image(&DecodeOptions{Surface: Selection{Item: item, Mip: mip}})
+			check(t, imageErr)
+
+			pixel := actual.(*image.RGBA).RGBAAt(0, 0)
+			if pixel.R > pixel.A || pixel.G > pixel.A || pixel.B > pixel.A || pixel.A != 128 {
+				t.Fatalf("invalid complete-texture pixel: %v", pixel)
+			}
+
+			// Native linear samples are encoded after association. Compare their
+			// decoded linear energy, not a matching color-conversion round trip.
+			channels := [...]uint8{pixel.R, pixel.G}
+			expected := [...]float64{float64(item*16) / 255, float64(mip*64) / 255}
+
+			for channel, value := range channels {
+				straight := uint16(float64(value) / 128 * 65535)
+				if math.Abs(linearSample(straight)-expected[channel]) > 0.02 {
+					t.Fatalf("item %d mip %d channel %d: %v", item, mip, channel, pixel)
+				}
+			}
+		}
+	}
+
+	if !bytes.Equal(fixtureTexture.pixels, original) || surfaces[0].Pixels[3] != 128 {
+		t.Fatal("modified caller-owned storage")
+	}
+
+	volume := fixture(t, "volume")
+	generated, err := volume.GenerateMipmaps(nil)
+	check(t, err)
+
+	generated = savedTexture(t, generated)
+	if generated.Metadata() != volume.Metadata() {
+		t.Fatalf("volume mips lost metadata: %+v", generated.Metadata())
+	}
+
+	// Four equally weighted depth slices have blue 0, 64, 128, 192.
+	last, err := generated.Image(&DecodeOptions{Surface: Selection{Mip: 2}})
+	check(t, err)
+
+	if last.(*image.NRGBA).NRGBAAt(0, 0).B != 96 {
+		t.Fatalf("volume depth filtering: %v", last.At(0, 0))
 	}
 }
 
