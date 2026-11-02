@@ -13,8 +13,8 @@ jobs:
         runner: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-15-intel, macos-15]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Fixture tests with the native C++ toolchain
@@ -28,7 +28,7 @@ jobs:
         os: [linux, windows, darwin]
         arch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: coalaura/build@v1
         with:
           os: ${{ matrix.os }}
