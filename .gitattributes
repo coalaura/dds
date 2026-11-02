@@ -1,0 +1,4 @@
+/internal/native/DirectX-Headers/** linguist-vendored
+/internal/native/DirectXMath/** linguist-vendored
+/internal/native/DirectXTex/** linguist-vendored
+/internal/native/sal/** linguist-vendored

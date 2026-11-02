@@ -104,4 +104,4 @@ Other fixtures use the pinned DirectXTex CPU backend: constant 5x3 samples cover
 
 ## License
 
-[MIT licensed](LICENSE), copyright (c) 2026 coalaura. DirectXTex, DirectXMath, DirectX-Headers and compatibility headers retain their upstream licenses/notices under `internal/native`.
+[MPL 2.0 licensed](LICENSE), copyright (c) 2026 coalaura. DirectXTex, DirectXMath, DirectX-Headers and compatibility headers retain their upstream licenses/notices under `internal/native`.
